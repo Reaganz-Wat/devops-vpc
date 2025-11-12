@@ -1,0 +1,305 @@
+#!/bin/bash
+
+# vpcctl - Simple VPC management tool for Linux
+# Uses network namespaces, bridges, and iptables
+
+STATE_FILE="/var/tmp/vpcctl_state.json"
+LOG_FILE="/var/tmp/vpcctl.log"
+
+# Log function
+log() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" | tee -a "$LOG_FILE"
+}
+
+# Check if running as root
+check_root() {
+    if [ "$EUID" -ne 0 ]; then
+        echo "ERROR: Please run as root (use sudo)"
+        exit 1
+    fi
+}
+
+# Initialize state file if it doesn't exist
+init_state() {
+    if [ ! -f "$STATE_FILE" ]; then
+        echo '{"vpcs":{}}' > "$STATE_FILE"
+    fi
+}
+
+# Create a new VPC
+create_vpc() {
+    local vpc_name=$1
+    local cidr=$2
+    local internet_iface=${3:-eth0}
+
+    log "Creating VPC: $vpc_name with CIDR: $cidr"
+
+    # Check if VPC already exists
+    if grep -q "\"$vpc_name\"" "$STATE_FILE" 2>/dev/null; then
+        log "ERROR: VPC $vpc_name already exists"
+        return 1
+    fi
+
+    # Create bridge
+    local bridge="br-$vpc_name"
+    ip link add "$bridge" type bridge
+    ip link set "$bridge" up
+
+    # Assign IP to bridge (use .1 as gateway)
+    local network=$(echo $cidr | cut -d'/' -f1)
+    local prefix=$(echo $cidr | cut -d'/' -f2)
+    local bridge_ip="${network%.*}.1/$prefix"
+    ip addr add "$bridge_ip" dev "$bridge"
+
+    # Save to state file
+    local temp_file=$(mktemp)
+    jq ".vpcs[\"$vpc_name\"] = {
+        \"cidr\": \"$cidr\",
+        \"bridge\": \"$bridge\",
+        \"bridge_ip\": \"$bridge_ip\",
+        \"internet_iface\": \"$internet_iface\",
+        \"subnets\": {},
+        \"peerings\": []
+    }" "$STATE_FILE" > "$temp_file"
+    mv "$temp_file" "$STATE_FILE"
+
+    log "VPC $vpc_name created successfully"
+}
+
+# Add subnet to VPC
+add_subnet() {
+    local vpc_name=$1
+    local subnet_name=$2
+    local subnet_cidr=$3
+    local subnet_type=$4
+
+    log "Adding $subnet_type subnet $subnet_name ($subnet_cidr) to VPC $vpc_name"
+
+    # Check if VPC exists
+    if ! grep -q "\"$vpc_name\"" "$STATE_FILE"; then
+        log "ERROR: VPC $vpc_name not found"
+        return 1
+    fi
+
+    # Get VPC info
+    local bridge=$(jq -r ".vpcs[\"$vpc_name\"].bridge" "$STATE_FILE")
+    local bridge_gw=$(jq -r ".vpcs[\"$vpc_name\"].bridge_ip" "$STATE_FILE" | cut -d'/' -f1)
+    local internet_iface=$(jq -r ".vpcs[\"$vpc_name\"].internet_iface" "$STATE_FILE")
+
+    # Create namespace
+    local ns_name="ns-$vpc_name-$subnet_name"
+    ip netns add "$ns_name"
+
+    # Create veth pair
+    local veth_host="veth-$subnet_name"
+    local veth_ns="veth-$subnet_name-ns"
+    ip link add "$veth_host" type veth peer name "$veth_ns"
+
+    # Connect to bridge
+    ip link set "$veth_host" master "$bridge"
+    ip link set "$veth_host" up
+
+    # Move to namespace
+    ip link set "$veth_ns" netns "$ns_name"
+
+    # Configure namespace interface
+    local network=$(echo $subnet_cidr | cut -d'/' -f1)
+    local prefix=$(echo $subnet_cidr | cut -d'/' -f2)
+    local subnet_ip="${network%.*}.10/$prefix"
+
+    ip netns exec "$ns_name" ip addr add "$subnet_ip" dev "$veth_ns"
+    ip netns exec "$ns_name" ip link set "$veth_ns" up
+    ip netns exec "$ns_name" ip link set lo up
+    ip netns exec "$ns_name" ip route add default via "$bridge_gw"
+
+    # Setup NAT for public subnet
+    if [ "$subnet_type" = "public" ]; then
+        iptables -t nat -A POSTROUTING -s "$subnet_cidr" -o "$internet_iface" -j MASQUERADE
+        echo 1 > /proc/sys/net/ipv4/ip_forward
+    fi
+
+    # Save to state
+    local temp_file=$(mktemp)
+    jq ".vpcs[\"$vpc_name\"].subnets[\"$subnet_name\"] = {
+        \"cidr\": \"$subnet_cidr\",
+        \"type\": \"$subnet_type\",
+        \"namespace\": \"$ns_name\",
+        \"veth_host\": \"$veth_host\",
+        \"veth_ns\": \"$veth_ns\",
+        \"ip\": \"$subnet_ip\"
+    }" "$STATE_FILE" > "$temp_file"
+    mv "$temp_file" "$STATE_FILE"
+
+    log "Subnet $subnet_name added successfully"
+}
+
+# Peer two VPCs
+peer_vpcs() {
+    local vpc1=$1
+    local vpc2=$2
+
+    log "Creating peering between $vpc1 and $vpc2"
+
+    # Get bridge info
+    local bridge1=$(jq -r ".vpcs[\"$vpc1\"].bridge" "$STATE_FILE")
+    local bridge2=$(jq -r ".vpcs[\"$vpc2\"].bridge" "$STATE_FILE")
+    local cidr1=$(jq -r ".vpcs[\"$vpc1\"].cidr" "$STATE_FILE")
+    local cidr2=$(jq -r ".vpcs[\"$vpc2\"].cidr" "$STATE_FILE")
+    local gw1=$(jq -r ".vpcs[\"$vpc1\"].bridge_ip" "$STATE_FILE" | cut -d'/' -f1)
+    local gw2=$(jq -r ".vpcs[\"$vpc2\"].bridge_ip" "$STATE_FILE" | cut -d'/' -f1)
+
+    # Create veth pair
+    local peer_veth1="peer-$vpc1-$vpc2"
+    local peer_veth2="peer-$vpc2-$vpc1"
+    ip link add "$peer_veth1" type veth peer name "$peer_veth2"
+
+    # Connect to bridges
+    ip link set "$peer_veth1" master "$bridge1"
+    ip link set "$peer_veth2" master "$bridge2"
+    ip link set "$peer_veth1" up
+    ip link set "$peer_veth2" up
+
+    # Add routes
+    ip route add "$cidr2" via "$gw2" dev "$bridge1" 2>/dev/null
+    ip route add "$cidr1" via "$gw1" dev "$bridge2" 2>/dev/null
+
+    log "Peering created successfully"
+}
+
+# Apply firewall policy
+apply_policy() {
+    local policy_file=$1
+
+    log "Applying policy from $policy_file"
+
+    # Read policy file
+    local subnet_cidr=$(jq -r '.subnet' "$policy_file")
+
+    # Find namespace for this subnet
+    local ns_name=""
+    for vpc in $(jq -r '.vpcs | keys[]' "$STATE_FILE"); do
+        for subnet in $(jq -r ".vpcs[\"$vpc\"].subnets | keys[]" "$STATE_FILE"); do
+            local cidr=$(jq -r ".vpcs[\"$vpc\"].subnets[\"$subnet\"].cidr" "$STATE_FILE")
+            if [ "$cidr" = "$subnet_cidr" ]; then
+                ns_name=$(jq -r ".vpcs[\"$vpc\"].subnets[\"$subnet\"].namespace" "$STATE_FILE")
+                break 2
+            fi
+        done
+    done
+
+    if [ -z "$ns_name" ]; then
+        log "ERROR: Subnet $subnet_cidr not found"
+        return 1
+    fi
+
+    # Apply ingress rules
+    local rules=$(jq -c '.ingress[]' "$policy_file" 2>/dev/null)
+    while IFS= read -r rule; do
+        local port=$(echo "$rule" | jq -r '.port')
+        local protocol=$(echo "$rule" | jq -r '.protocol')
+        local action=$(echo "$rule" | jq -r '.action' | tr '[:lower:]' '[:upper:]')
+
+        if [ "$action" = "ALLOW" ]; then
+            ip netns exec "$ns_name" iptables -A INPUT -p "$protocol" --dport "$port" -j ACCEPT
+        else
+            ip netns exec "$ns_name" iptables -A INPUT -p "$protocol" --dport "$port" -j DROP
+        fi
+        log "Applied rule: $protocol:$port -> $action"
+    done <<< "$rules"
+
+    log "Policy applied successfully"
+}
+
+# List all VPCs
+list_vpcs() {
+    echo ""
+    echo "=== VPCs ==="
+    for vpc in $(jq -r '.vpcs | keys[]' "$STATE_FILE" 2>/dev/null); do
+        echo ""
+        echo "VPC: $vpc"
+        echo "  CIDR: $(jq -r ".vpcs[\"$vpc\"].cidr" "$STATE_FILE")"
+        echo "  Bridge: $(jq -r ".vpcs[\"$vpc\"].bridge" "$STATE_FILE")"
+        echo "  Subnets:"
+        for subnet in $(jq -r ".vpcs[\"$vpc\"].subnets | keys[]" "$STATE_FILE" 2>/dev/null); do
+            local type=$(jq -r ".vpcs[\"$vpc\"].subnets[\"$subnet\"].type" "$STATE_FILE")
+            local cidr=$(jq -r ".vpcs[\"$vpc\"].subnets[\"$subnet\"].cidr" "$STATE_FILE")
+            echo "    - $subnet ($type): $cidr"
+        done
+    done
+    echo ""
+}
+
+# Delete VPC
+delete_vpc() {
+    local vpc_name=$1
+
+    log "Deleting VPC: $vpc_name"
+
+    # Get VPC info
+    local bridge=$(jq -r ".vpcs[\"$vpc_name\"].bridge" "$STATE_FILE")
+    local internet_iface=$(jq -r ".vpcs[\"$vpc_name\"].internet_iface" "$STATE_FILE")
+
+    # Delete subnets
+    for subnet in $(jq -r ".vpcs[\"$vpc_name\"].subnets | keys[]" "$STATE_FILE" 2>/dev/null); do
+        local ns=$(jq -r ".vpcs[\"$vpc_name\"].subnets[\"$subnet\"].namespace" "$STATE_FILE")
+        local cidr=$(jq -r ".vpcs[\"$vpc_name\"].subnets[\"$subnet\"].cidr" "$STATE_FILE")
+        local type=$(jq -r ".vpcs[\"$vpc_name\"].subnets[\"$subnet\"].type" "$STATE_FILE")
+
+        # Remove NAT rule if public
+        if [ "$type" = "public" ]; then
+            iptables -t nat -D POSTROUTING -s "$cidr" -o "$internet_iface" -j MASQUERADE 2>/dev/null
+        fi
+
+        # Delete namespace
+        ip netns del "$ns" 2>/dev/null
+        log "Deleted subnet $subnet"
+    done
+
+    # Delete bridge
+    ip link set "$bridge" down 2>/dev/null
+    ip link del "$bridge" 2>/dev/null
+
+    # Remove from state
+    local temp_file=$(mktemp)
+    jq "del(.vpcs[\"$vpc_name\"])" "$STATE_FILE" > "$temp_file"
+    mv "$temp_file" "$STATE_FILE"
+
+    log "VPC $vpc_name deleted successfully"
+}
+
+# Main script
+check_root
+init_state
+
+case "$1" in
+    create-vpc)
+        create_vpc "$2" "$3" "$4"
+        ;;
+    add-subnet)
+        add_subnet "$2" "$3" "$4" "$5"
+        ;;
+    peer-vpcs)
+        peer_vpcs "$2" "$3"
+        ;;
+    apply-policy)
+        apply_policy "$2"
+        ;;
+    list)
+        list_vpcs
+        ;;
+    delete-vpc)
+        delete_vpc "$2"
+        ;;
+    *)
+        echo "Usage: $0 {create-vpc|add-subnet|peer-vpcs|apply-policy|list|delete-vpc}"
+        echo ""
+        echo "Commands:"
+        echo "  create-vpc <name> <cidr> [internet-iface]"
+        echo "  add-subnet <vpc> <subnet-name> <cidr> <public|private>"
+        echo "  peer-vpcs <vpc1> <vpc2>"
+        echo "  apply-policy <policy-file.json>"
+        echo "  list"
+        echo "  delete-vpc <name>"
+        exit 1
+        ;;
+esac
