@@ -17,15 +17,9 @@ for br in $(ip link show type bridge | grep "^[0-9]" | grep "br-" | awk '{print 
     echo "  Deleted: $br"
 done
 
-# Delete all veth pairs starting with veth-
+# Delete all veth pairs created by vpcctl (pattern: v{vpc}{subnet}-h)
 echo "Deleting veth pairs..."
-for veth in $(ip link | grep "^[0-9]" | grep "veth-" | awk '{print $2}' | cut -d: -f1 | cut -d@ -f1); do
-    sudo ip link del "$veth" 2>/dev/null
-    echo "  Deleted: $veth"
-done
-
-# Delete all peer veth pairs
-for veth in $(ip link | grep "^[0-9]" | grep "peer-" | awk '{print $2}' | cut -d: -f1 | cut -d@ -f1); do
+for veth in $(ip link show type veth 2>/dev/null | grep "^[0-9]" | awk '{print $2}' | cut -d: -f1 | cut -d@ -f1); do
     sudo ip link del "$veth" 2>/dev/null
     echo "  Deleted: $veth"
 done
@@ -44,4 +38,4 @@ echo "=== Cleanup Complete ==="
 echo "Verification:"
 echo "Namespaces: $(ip netns list | wc -l)"
 echo "Bridges: $(ip link show type bridge | grep "br-" | wc -l)"
-echo "Veth pairs: $(ip link | grep "veth-" | wc -l)"
+echo "Veth pairs: $(ip link show type veth 2>/dev/null | wc -l)"
