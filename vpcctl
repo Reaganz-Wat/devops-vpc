@@ -85,14 +85,19 @@ add_subnet() {
     local bridge=$(jq -r ".vpcs[\"$vpc_name\"].bridge" "$STATE_FILE")
     local bridge_gw=$(jq -r ".vpcs[\"$vpc_name\"].bridge_ip" "$STATE_FILE" | cut -d'/' -f1)
     local internet_iface=$(jq -r ".vpcs[\"$vpc_name\"].internet_iface" "$STATE_FILE")
+    local vpc_cidr=$(jq -r ".vpcs[\"$vpc_name\"].cidr" "$STATE_FILE")
+    local vpc_prefix=$(echo $vpc_cidr | cut -d'/' -f2)
 
     # Create namespace
     local ns_name="ns-$vpc_name-$subnet_name"
     ip netns add "$ns_name"
 
-    # Create veth pair
-    local veth_host="veth-$subnet_name"
-    local veth_ns="veth-$subnet_name-ns"
+    # Create veth pair (short names - Linux has 15 char limit for interface names)
+    # Use format: v{vpc}{subnet}-h and v{vpc}{subnet}-n
+    local vpc_short=$(echo "$vpc_name" | head -c 4)
+    local subnet_short=$(echo "$subnet_name" | head -c 4)
+    local veth_host="v${vpc_short}${subnet_short}-h"
+    local veth_ns="v${vpc_short}${subnet_short}-n"
     ip link add "$veth_host" type veth peer name "$veth_ns"
 
     # Connect to bridge
@@ -105,7 +110,8 @@ add_subnet() {
     # Configure namespace interface
     local network=$(echo $subnet_cidr | cut -d'/' -f1)
     local prefix=$(echo $subnet_cidr | cut -d'/' -f2)
-    local subnet_ip="${network%.*}.10/$prefix"
+    # Use VPC prefix to ensure gateway is reachable
+    local subnet_ip="${network%.*}.10/$vpc_prefix"
 
     ip netns exec "$ns_name" ip addr add "$subnet_ip" dev "$veth_ns"
     ip netns exec "$ns_name" ip link set "$veth_ns" up
