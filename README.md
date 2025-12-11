@@ -9,6 +9,18 @@ A simple Linux-based VPC management tool that creates virtual private clouds usi
 - `jq` package installed (`sudo apt install jq`)
 - Basic networking tools (ip, iptables, bridge)
 
+## 📖 Documentation & Tutorial
+
+For a complete step-by-step tutorial on how to use this tool to build a Virtual Private Cloud from scratch, check out the Medium article:
+
+[**Building a Virtual Private Cloud (VPC) from Scratch on Linux**](https://medium.com/@reaganwatmon6/building-a-virtual-private-cloud-vpc-from-scratch-on-linux-68e12d336034)
+
+This tutorial covers:
+- VPC concepts and architecture
+- Detailed setup instructions
+- Practical examples and use cases
+- Troubleshooting common issues
+
 ## Installation
 
 ```bash
